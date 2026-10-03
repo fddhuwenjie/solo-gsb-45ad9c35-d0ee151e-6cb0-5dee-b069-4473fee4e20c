@@ -60,10 +60,18 @@ def build_events(
     max_rate_lux_per_s: float,
     stuck_tol_lux: float,
     min_stuck_s: float,
+    barriers: list[float] | None = None,
 ) -> list[DiagnosisEvent]:
-    """在完整时间线上构建全部质量事件（尚未按窗口筛选）。"""
+    """在完整时间线上构建全部质量事件（尚未按窗口筛选）。
+
+    ``barriers`` 为不落到任何点上、但必须**切断连续链**的时刻（升序）：
+    位于断点两侧的读数之间不形成 gap / jump / stuck 关联，也不产生任何
+    事件——用于多来源仲裁后保持冲突的时刻（该冲突状态只保留给权威时间线
+    查询）。``barriers`` 与分组时刻相同时以分组本身的处理为准。
+    """
     # 按 (时刻, 读数 ID) 排序，保证同时刻读数相邻且 ID 顺序确定
     ordered = sorted(readings, key=lambda r: (r[1], r[0]))
+    barrier_ts = sorted(barriers) if barriers else []
 
     # ---- 按时刻分组：同值合并 / 异值记 timestamp_conflict ----
     groups: list[tuple[float, list[tuple[str, float]]]] = []
@@ -96,7 +104,16 @@ def build_events(
         run.clear()
 
     prev: _Point | None = None
+    bi = 0  # 断点游标
     for ts, members in groups:
+        # 位于上一个点之后、当前点之前的断点：截断卡死链并重置 prev，
+        # 两侧读数之间不形成 gap / jump，断点本身不产生任何事件。
+        while bi < len(barrier_ts) and barrier_ts[bi] < ts:
+            flush_stuck()
+            prev = None
+            bi += 1
+        while bi < len(barrier_ts) and barrier_ts[bi] == ts:
+            bi += 1  # 与权威点同刻的断点不另作处理
         lux_values = {lux for _, lux in members}
         ids = [rid for rid, _ in members]
         if len(lux_values) > 1:

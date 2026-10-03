@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -103,6 +104,7 @@ def compute_dose(
     max_interval_s: float,
     dose_limit_luxh: float,
     open_intervals: list[tuple[float, float]] | None = None,
+    breaks: list[float] | None = None,
 ) -> DoseResult:
     """核算时段剂量。
 
@@ -116,7 +118,21 @@ def compute_dose(
     ``open_intervals`` 为展陈日历展开后的绝对开放区间（Unix 秒，升序、互不
     重叠），须覆盖从最早读数到窗口末的全部相关时间；传入后积分只在开放
     区间内裁剪，历史口径也只累计开放历史。为 None 时保持原有口径。
+
+    ``breaks`` 为**不落到任何读数上、但积分必须在此断开**的时刻（升序），
+    用于多来源仲裁后保持冲突的采样时刻：冲突读数不作为梯形段端点，任何
+    跨过断点的相邻权威点对都不参与积分（即使两点间隔未超过
+    ``max_interval_s``），窗口剂量、缺测 / 覆盖 / 闭馆时长、截至窗口末的
+    累计剂量与首次越线全部按断点切分后的各段分别处理（累计剂量与首次越线
+    在各段上顺延，绝不重置）。
     """
+    break_ts = sorted(breaks) if breaks else []
+
+    def has_break(lo: float, hi: float) -> bool:
+        """开区间 (lo, hi) 内是否存在断点。"""
+        i = bisect_right(break_ts, lo)
+        return i < len(break_ts) and break_ts[i] < hi
+
     window_known = 0.0
     covered = 0.0
     history_known = 0.0
@@ -127,7 +143,9 @@ def compute_dose(
     for ts, lux in readings:
         if prev_ts is not None:
             dt = ts - prev_ts
-            if dt > 0.0 and dt <= max_interval_s:
+            # 仲裁冲突时刻把时间线切成互不相通的段：跨断点的权威点对
+            # 不插值、不积分，两个口径都在断点处断开。
+            if dt > 0.0 and dt <= max_interval_s and not has_break(prev_ts, ts):
                 # ---- 窗口口径：与 [start_s, end_s]（及开放区间）求交后梯形裁剪 ----
                 for lo, hi in _pieces(prev_ts, ts, start_s, end_s, open_intervals):
                     l_lo = _lux_at(prev_lux, lux, (lo - prev_ts) / dt)
@@ -147,7 +165,7 @@ def compute_dose(
                         offset = _crossing_offset(h_lux_lo, h_lux_hi, h_dt, need_luxs)
                         first_exceeded_at = lo + (offset if offset is not None else h_dt)
                     history_known += h_seg
-            # 间隔超过上限：缺测段不插值，两个口径都不累计
+            # 间隔超过上限或跨仲裁断点：缺测段不插值，两个口径都不累计
         prev_ts, prev_lux = ts, lux
 
     window_len = end_s - start_s

@@ -12,7 +12,9 @@
   优先级最高的来源集合：
   * 集合内照度唯一 → 该值为该时刻的**权威值**；
   * 集合内照度不同（最高级并列）→ 该时刻**保持冲突**，不进入剂量或
-    诊断时间线（诊断中仍作为 ``timestamp_conflict`` 事件出现）。
+    诊断时间线：权威时间线查询仍返回其冲突状态；剂量积分在该时刻**断开**
+    （冲突读数不作为任何梯形段端点）；诊断连续链在其两侧重置，且**不**
+    生成 ``timestamp_conflict`` 事件（该事件只保留给未仲裁的平权冲突）。
 - 优先级调整只从生效时刻起影响重算：历史收据与原始读数行绝不改写，
   仲裁在查询时实时进行。
 - 展品没有任何优先级版本时，仲裁退化为原有平权口径（同时刻同值合并、
@@ -160,21 +162,23 @@ def arbitrate(
 def diagnosis_feed(
     points: list[ArbitrationPoint],
     conflicts: list[ArbitrationConflict],
-) -> list[tuple[str, float, float]]:
-    """把仲裁结果展开为诊断模块的输入读数。
+) -> tuple[list[tuple[str, float, float]], list[float]]:
+    """把仲裁结果展开为诊断模块的输入。
 
-    权威点按胜出集合逐条展开（同值，诊断分组会重新合并为一个点）；
-    冲突时刻按并列集合逐条展开（异值，诊断会形成 timestamp_conflict，
-    该时刻不落点）。被仲裁丢弃的低优先级读数不进入诊断时间线。
+    返回（权威点展开读数, 冲突时刻断点列表）：
+    - 权威点按胜出集合逐条展开（同值，诊断分组会重新合并为一个点）；
+    - 保持冲突的时刻**不作为读数进入诊断**（不生成
+      ``timestamp_conflict``——该状态保留给权威时间线查询），但其时刻作为
+      **断点**返回：诊断的连续链（gap/jump/stuck）在断点两侧重置，绝不在
+      断点两侧读数之间直接相连。
+    - 被仲裁丢弃的低优先级读数同样不进入诊断时间线。
     """
     feed: list[tuple[str, float, float]] = []
     for p in points:
         for m in p.members:
             feed.append((m.reading_id, p.ts, p.lux))
-    for c in conflicts:
-        for m in c.members:
-            feed.append((m.reading_id, c.ts, m.lux))
-    return feed
+    barriers = sorted(c.ts for c in conflicts)
+    return feed, barriers
 
 
 def first_point_after(

@@ -591,7 +591,10 @@ def diagnose_readings(
       并从两侧中断连续链；
     - 已配置来源优先级版本时，诊断基于**权威时间线**：每个采样时刻先按
       生效版本仲裁（最高优先级来源胜出；最高级并列且照度不同的时刻保持
-      冲突、不落点），被仲裁丢弃的低优先级读数不进入诊断时间线；
+      冲突、不落点），被仲裁丢弃的低优先级读数不进入诊断时间线；仲裁冲突
+      时刻从两侧重置连续链（不形成跨冲突的 gap / jump / stuck），且**不**
+      生成 ``timestamp_conflict`` 事件——该冲突状态保留给权威时间线查询
+      （未配置版本的平权异值冲突仍按 ``timestamp_conflict`` 报告）；
     - 对无歧义读数：相邻间隔**超过**展品 ``max_interval_seconds`` 记为
       ``gap``；间隔合规但变化速率 ``|Δlux|/Δt`` 超过
       ``max_rate_lux_per_second`` 记为 ``jump``；相邻照度差均不超过
@@ -619,12 +622,13 @@ def diagnose_readings(
         (canonical_id,),
     ).fetchall()
     versions = load_priority_versions(conn, canonical_id)
+    barriers: list[float] = []
     if versions:
         points, arb_conflicts = arbitrate(
             [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in rows],
             versions,
         )
-        feed = diagnosis_feed(points, arb_conflicts)
+        feed, barriers = diagnosis_feed(points, arb_conflicts)
     else:
         feed = [(r["reading_id"], r["ts"], r["lux"]) for r in rows]
     events = build_events(
@@ -633,6 +637,7 @@ def diagnose_readings(
         max_rate_lux_per_s=payload.max_rate_lux_per_second,
         stuck_tol_lux=payload.stuck_tolerance_lux,
         min_stuck_s=payload.min_stuck_seconds,
+        barriers=barriers,
     )
     events = sort_events(intersect_window(events, start_s, end_s))
 
@@ -691,7 +696,11 @@ def query_dose(
     - 请求 ID 若是已归并档案的别名，自动解析到规范档案；
     - 已配置来源优先级版本时，剂量基于**权威时间线**：每个采样时刻按生效
       版本仲裁出权威值（最高级并列且照度不同的时刻保持冲突、不进入剂量
-      时间线），``reading_count`` 为窗口内权威点数量；未配置时保持原有口径；
+      时间线），``reading_count`` 为窗口内权威点数量；冲突时刻的权威状态
+      仍可通过权威时间线查询，但**冲突读数不作为任何梯形段端点**——积分
+      （含窗口裁剪与截至窗口末的历史累计）在冲突处断开，缺测、覆盖 /
+      闭馆时长、剩余额度与首次越线均按断点后的各段分别处理；
+      未配置时保持原有口径；
     - ``calendar=display`` 时仅在开放区间内裁剪梯形积分：窗口内闭馆时长
       单列 closed_seconds，covered_seconds、unknown_seconds、closed_seconds
       之和等于窗口时长；剩余额度与首次越线也按截至窗口末的开放历史计算；
@@ -710,18 +719,23 @@ def query_dose(
     # 窗口起点之前的历史读数本身就在 1) 中，窗口起点处同样可线性裁剪。
     # 配置了来源优先级版本时，读数先逐时刻仲裁为权威时间线（冲突时刻不进入）。
     versions = load_priority_versions(conn, canonical_id)
+    breaks: list[float] = []
     if versions:
+        # 仲裁在完整时间线上进行：窗口终点之后、窗口裁剪锚点之前的冲突时刻
+        # 同样要断开两侧权威点，不能借窗口裁剪把它们直接相连。
         all_rows = conn.execute(
             "SELECT reading_id, ts, lux, source_id FROM readings "
-            "WHERE exhibit_id = ? AND ts <= ? AND voided_at IS NULL "
-            "ORDER BY ts, reading_id",
-            (canonical_id, end_s),
+            "WHERE exhibit_id = ? AND voided_at IS NULL ORDER BY ts, reading_id",
+            (canonical_id,),
         ).fetchall()
-        points, _arb_conflicts = arbitrate(
+        points, arb_conflicts = arbitrate(
             [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in all_rows],
             versions,
         )
-        readings = [(p.ts, p.lux) for p in points]
+        readings = [(p.ts, p.lux) for p in points if p.ts <= end_s]
+        # 仲裁冲突时刻不作为积分端点：梯形积分在这些时刻断开，
+        # 窗口剂量、缺测/覆盖/闭馆统计与截至窗口末的历史累计均按断点切段。
+        breaks = [c.ts for c in arb_conflicts]
         after_point = first_point_after(conn, canonical_id, versions, end_s)
         if after_point is not None:
             readings.append((after_point.ts, after_point.lux))
@@ -760,6 +774,7 @@ def query_dose(
         max_interval_s=exhibit["max_interval_seconds"],
         dose_limit_luxh=exhibit["dose_limit_luxh"],
         open_intervals=intervals,
+        breaks=breaks,
     )
     response = DoseResponse(
         requested_id=exhibit_id,
