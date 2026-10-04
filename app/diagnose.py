@@ -1,7 +1,7 @@
 """照度采集质量诊断：在规范档案的**完整时间线**上识别采集质量事件。
 
 事件类型：
-- ``timestamp_conflict``：同一时刻存在**照度不同**的读数，该时刻有歧义，
+- ``timestamp_conflict``：同一时刻存在**照度不同**的原始读数，该时刻有歧义，
   不参与任何连续链并同时截断其前后侧的 stuck 链；同一时刻照度完全相同的
   多条读数先合并为时间线上的一个点（读数 ID 全部保留）；
 - ``gap``：两个相邻无歧义读数的间隔**超过**展品 ``max_interval_seconds``
@@ -10,7 +10,14 @@
   ``|Δlux| / Δt`` **超过**调用方给定上限（恰好等于不算 jump）；
 - ``stuck``：由相邻无歧义读数组成的**最大**连续链，链上每一对相邻读数的
   照度差都不超过卡死容差，且首末读数累计时长达到最短持续时长。
-  gap、jump、照度差超过容差的相邻对以及 timestamp_conflict 都会截断链。
+  gap、jump、照度差超过容差的相邻对、timestamp_conflict 与外部断点都会
+  截断链。
+
+``breaks`` 给出**外部仲裁断点**（多来源仲裁中保持冲突的时刻）：这些时刻
+不落为时间线上的点，gap / jump / stuck 等连续链在其两侧各自重置，但**不
+生成任何事件**（尤其不生成 ``timestamp_conflict``——仲裁冲突只在权威时间
+线查询中保留其冲突状态）。这与原始读数自身的同时刻异值冲突不同：后者仍
+产生 ``timestamp_conflict`` 事件。
 
 事件先基于完整时间线一次性形成（与查询窗口无关），再由调用方筛选与窗口
 **相交**的事件；筛选只做包含/排除，绝不裁剪事件的原始边界与相关读数 ID，
@@ -18,6 +25,7 @@
 """
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 
 # 起点相同时的类型先后（实际数据中不同类型事件一般不会共用起点，
@@ -60,10 +68,22 @@ def build_events(
     max_rate_lux_per_s: float,
     stuck_tol_lux: float,
     min_stuck_s: float,
+    breaks: list[float] | None = None,
 ) -> list[DiagnosisEvent]:
-    """在完整时间线上构建全部质量事件（尚未按窗口筛选）。"""
+    """在完整时间线上构建全部质量事件（尚未按窗口筛选）。
+
+    ``breaks`` 为外部仲裁断点（多来源仲裁保持冲突的时刻），须按时刻升序。
+    断点不落点、不产生任何事件，只把连续链在其两侧重置：断点两侧相邻的
+    权威点之间不形成 gap / jump，stuck 链同样在两侧分别起算。
+    """
     # 按 (时刻, 读数 ID) 排序，保证同时刻读数相邻且 ID 顺序确定
     ordered = sorted(readings, key=lambda r: (r[1], r[0]))
+    break_ts = sorted(breaks or [])
+
+    def broken_between(lo: float, hi: float) -> bool:
+        """(lo, hi) 内是否存在仲裁断点（开区间：与端点重合不影响该对）。"""
+        i = bisect_left(break_ts, lo)
+        return i < len(break_ts) and break_ts[i] < hi
 
     # ---- 按时刻分组：同值合并 / 异值记 timestamp_conflict ----
     groups: list[tuple[float, list[tuple[str, float]]]] = []
@@ -111,6 +131,12 @@ def build_events(
             ))
             prev = None
             continue
+
+        # 外部仲裁断点：两侧连续链各自重置，不产生 gap / jump / stuck，
+        # 也不产生 timestamp_conflict（仲裁冲突仅保留在权威时间线查询中）。
+        if prev is not None and broken_between(prev.ts, ts):
+            flush_stuck()
+            prev = None
 
         cur = _Point(ts=ts, lux=members[0][1], ids=ids)
         if prev is not None:

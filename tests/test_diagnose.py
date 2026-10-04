@@ -381,3 +381,22 @@ def test_intersect_window_keeps_original_boundaries():
     assert len(hits) == 1
     assert (hits[0].start, hits[0].end) == (100.0, 200.0)
     assert hits[0].reading_ids == ["b", "c"]
+
+
+def test_arbitration_breaks_reset_chains_silently():
+    """外部仲裁断点：链在两侧重置，不产生任何事件（含 timestamp_conflict）。
+
+    断点两侧权威点间隔超限（本应 gap）、照度差极大（本应 jump），
+    且各自的平稳段长度都足以成为 stuck——断点只把它们隔成两段 stuck。
+    """
+    readings = [
+        ("a", 0.0, 10.0), ("b", 600.0, 10.0),       # 前侧平稳段
+        ("c", 5000.0, 9000.0), ("d", 5600.0, 9000.0),  # 后侧平稳段
+    ]
+    events = build_events(
+        readings, max_interval_s=3600.0, max_rate_lux_per_s=1.0,
+        stuck_tol_lux=0.0, min_stuck_s=600.0,
+        breaks=[2000.0],
+    )
+    assert [e.type for e in sort_events(events)] == ["stuck", "stuck"]
+    assert [e.reading_ids for e in events] == [["a", "b"], ["c", "d"]]

@@ -270,13 +270,9 @@ def test_tied_unlisted_sources_conflict_excluded(client):
     assert got["known_dose_luxh"] == 0.0
 
     events = diagnose(client, eid, BASE, BASE + 3600)["events"]
-    conflict = [e for e in events if e["type"] == "timestamp_conflict"]
-    assert len(conflict) == 1
-    assert conflict[0]["reading_ids"] == ["r2", "r3"]
-    assert conflict[0]["lux_span"] == 100.0
-    # 冲突时刻从两侧中断连续链（与既有诊断语义一致），不形成跨冲突的 gap 事件；
-    # 剂量口径的缺测由上面的 unknown_seconds 体现
-    assert [e for e in events if e["type"] == "gap"] == []
+    # 仲裁保持冲突的时刻不作为诊断输入：不产生 timestamp_conflict，
+    # 也不形成跨冲突的 gap；连续链在两侧静默重置。
+    assert [e["type"] for e in events] == []
 
     tl = timeline(client, eid, BASE, BASE + 3600)
     statuses = [e["status"] for e in tl["entries"]]
@@ -430,8 +426,8 @@ def test_timeline_window_and_validation(client):
     assert resp.status_code == 422
 
 
-def test_dose_after_point_skips_conflict(client):
-    """窗口终点之后最近权威点：保持冲突的时刻被跳过。"""
+def test_dose_does_not_clip_across_conflict_to_after_point(client):
+    """窗口终点之后最近权威点与窗口侧权威点之间夹着冲突时刻：不跨冲突裁剪。"""
     eid = make_exhibit(client, interval=3600.0)
     send(client, eid, [
         {"id": "r1", "ts": iso(BASE), "lux": 100, "source_id": "a"},
@@ -441,9 +437,208 @@ def test_dose_after_point_skips_conflict(client):
     ])
     put_priority(client, eid, ["a"], BASE - 10, 0)
     got = dose(client, eid, BASE, BASE + 1900)
-    # 冲突时刻（BASE+2700）不进入时间线；窗口末端向 BASE+3600 的权威点裁剪
+    # BASE 与 BASE+3600 两个权威点之间夹着冲突时刻（BASE+2700）：即使两端
+    # 间隔恰好等于 max_interval，也不得把两侧直接相连，窗口全部缺测。
+    assert got["covered_seconds"] == 0.0
+    assert got["unknown_seconds"] == 1900.0
+    assert got["known_dose_luxh"] == 0.0
+
+
+def test_dose_clips_to_after_point_when_no_conflict_between(client):
+    """无冲突时刻相隔时，窗口末端仍可向后一个权威点线性裁剪（旧行为不变）。"""
+    eid = make_exhibit(client, interval=3600.0)
+    send(client, eid, [
+        {"id": "r1", "ts": iso(BASE), "lux": 100, "source_id": "a"},
+        {"id": "r2", "ts": iso(BASE + 2700), "lux": 100, "source_id": "a"},
+        {"id": "r4", "ts": iso(BASE + 3600), "lux": 100, "source_id": "a"},
+    ])
+    put_priority(client, eid, ["a"], BASE - 10, 0)
+    got = dose(client, eid, BASE, BASE + 1900)
     assert got["covered_seconds"] == 1900.0
     assert got["unknown_seconds"] == 0.0
+
+
+# ---------- 仲裁冲突作为断点：剂量在冲突处断开（回归） ----------
+
+def test_middle_conflict_breaks_dose_even_when_interval_compliant(client):
+    """中间冲突：两侧权威点间隔即使不超限，也不得直接相连积分。"""
+    eid = make_exhibit(client, limit=1000.0, interval=3600.0)
+    send(client, eid, [
+        {"id": "a0", "ts": iso(BASE), "lux": 100, "source_id": "a"},
+        {"id": "c1", "ts": iso(BASE + 1800), "lux": 100, "source_id": "c"},
+        {"id": "d1", "ts": iso(BASE + 1800), "lux": 200, "source_id": "d"},
+        {"id": "a2", "ts": iso(BASE + 3600), "lux": 100, "source_id": "a"},
+    ])
+    put_priority(client, eid, ["a"], BASE - 10, 0)
+    got = dose(client, eid, BASE, BASE + 3600)
+    # 冲突时刻不积分：BASE→冲突、冲突→BASE+3600 两段都缺测，整窗未知
+    assert got["known_dose_luxh"] == 0.0
+    assert got["covered_seconds"] == 0.0
+    assert got["unknown_seconds"] == 3600.0
+    # 权威点仍在（冲突时刻不计 reading_count）
+    assert got["reading_count"] == 2
+    # 冲突状态保留在权威时间线查询中
+    assert [e["status"] for e in timeline(client, eid, BASE, BASE + 3600)["entries"]] == [
+        "ok", "conflict", "ok",
+    ]
+
+
+def test_middle_conflict_dose_segments_each_side(client):
+    """断点两侧各有合规相邻点时，只积分断点两侧各自的段，不跨越冲突。"""
+    eid = make_exhibit(client, limit=10000.0, interval=3600.0)
+    send(client, eid, [
+        {"id": "a0", "ts": iso(BASE), "lux": 100, "source_id": "a"},
+        {"id": "a1", "ts": iso(BASE + 1800), "lux": 100, "source_id": "a"},
+        {"id": "c2", "ts": iso(BASE + 3600), "lux": 100, "source_id": "c"},
+        {"id": "d2", "ts": iso(BASE + 3600), "lux": 200, "source_id": "d"},
+        {"id": "a3", "ts": iso(BASE + 5400), "lux": 100, "source_id": "a"},
+        {"id": "a4", "ts": iso(BASE + 7200), "lux": 100, "source_id": "a"},
+    ])
+    put_priority(client, eid, ["a"], BASE - 10, 0)
+    got = dose(client, eid, BASE, BASE + 7200)
+    # 仅 (0,1800) 与 (5400,7200) 两段各 0.5h × 100 lux = 50 lux·h
+    assert got["known_dose_luxh"] == 100.0
+    assert got["covered_seconds"] == 3600.0
+    # 1800→冲突(3600)、冲突→5400 各 1800s 缺测
+    assert got["unknown_seconds"] == 3600.0
+    assert got["reading_count"] == 4
+
+
+def test_middle_conflict_segments_history_and_first_exceeded(client):
+    """截至窗口末的累计剂量与首次越线按断点后的各段分别处理，不跨越冲突。"""
+    eid = make_exhibit(client, limit=300.0, interval=3600.0)
+    send(client, eid, [
+        {"id": "a0", "ts": iso(BASE), "lux": 400, "source_id": "a"},
+        {"id": "a1", "ts": iso(BASE + 900), "lux": 400, "source_id": "a"},
+        {"id": "c1", "ts": iso(BASE + 1800), "lux": 100, "source_id": "c"},
+        {"id": "d1", "ts": iso(BASE + 1800), "lux": 200, "source_id": "d"},
+        {"id": "a2", "ts": iso(BASE + 2700), "lux": 400, "source_id": "a"},
+        {"id": "a3", "ts": iso(BASE + 3600), "lux": 400, "source_id": "a"},
+        {"id": "a4", "ts": iso(BASE + 4500), "lux": 400, "source_id": "a"},
+    ])
+    put_priority(client, eid, ["a"], BASE - 10, 0)
+    # 窗口止于冲突后、后段累计尚不足上限：前段 100+100=200 lux·h，不越线
+    before = dose(client, eid, BASE, BASE + 3600)
+    assert before["known_dose_luxh"] == 200.0
+    assert before["remaining_luxh"] == 100.0
+    assert before["exceeded"] is False
+    assert before["first_exceeded_at"] is None
+    # 延伸窗口：后段 (2700,3600)=100、(3600,4500)=100，累计 400 > 300，
+    # 首次越线发生在后段（绝不把冲突两侧直接相连而提前在冲突前段越线）
+    after = dose(client, eid, BASE, BASE + 4500)
+    assert after["known_dose_luxh"] == 300.0
+    assert after["exceeded"] is True
+    crossed = datetime.fromisoformat(after["first_exceeded_at"]).timestamp()
+    assert crossed > BASE + 2700  # 越线时刻在冲突之后的段内
+    # 缩窄窗口到越线之后：全历史口径结果不变
+    narrow = dose(client, eid, BASE + 3600, BASE + 4500)
+    assert narrow["first_exceeded_at"] == after["first_exceeded_at"]
+    assert narrow["remaining_luxh"] == after["remaining_luxh"]
+
+
+def test_conflict_at_window_start_boundary(client):
+    """冲突恰在窗口起点：窗口不从冲突时刻延伸覆盖，从首个窗口内权威点起算。"""
+    eid = make_exhibit(client, limit=10000.0, interval=3600.0)
+    send(client, eid, [
+        {"id": "c0", "ts": iso(BASE), "lux": 100, "source_id": "c"},
+        {"id": "d0", "ts": iso(BASE), "lux": 200, "source_id": "d"},
+        {"id": "a1", "ts": iso(BASE + 900), "lux": 100, "source_id": "a"},
+        {"id": "a2", "ts": iso(BASE + 1800), "lux": 100, "source_id": "a"},
+    ])
+    put_priority(client, eid, ["a"], BASE - 10, 0)
+    got = dose(client, eid, BASE, BASE + 1800)
+    # 冲突在窗口起点（断点与窗口端点重合）：只有 900→1800 一段覆盖 900s
+    assert got["known_dose_luxh"] == 25.0
+    assert got["covered_seconds"] == 900.0
+    assert got["unknown_seconds"] == 900.0
+    # 冲突时刻本身在窗口内：reading_count 只数权威点
+    assert got["reading_count"] == 2
+
+
+def test_conflict_at_window_end_boundary(client):
+    """冲突恰在窗口终点：末段不延伸到冲突时刻，窗口末为缺测。"""
+    eid = make_exhibit(client, limit=10000.0, interval=3600.0)
+    send(client, eid, [
+        {"id": "a0", "ts": iso(BASE), "lux": 100, "source_id": "a"},
+        {"id": "a1", "ts": iso(BASE + 900), "lux": 100, "source_id": "a"},
+        {"id": "c2", "ts": iso(BASE + 1800), "lux": 100, "source_id": "c"},
+        {"id": "d2", "ts": iso(BASE + 1800), "lux": 200, "source_id": "d"},
+    ])
+    put_priority(client, eid, ["a"], BASE - 10, 0)
+    got = dose(client, eid, BASE, BASE + 1800)
+    assert got["known_dose_luxh"] == 25.0
+    assert got["covered_seconds"] == 900.0
+    assert got["unknown_seconds"] == 900.0
+    assert got["reading_count"] == 2  # 窗口端点评级：权威点 2 个，冲突时刻不计
+
+
+def test_conflict_between_clip_points_outside_window(client):
+    """冲突位于窗口外但夹在窗口侧权威点与窗口外相邻权威点之间：不跨冲突裁剪。"""
+    eid = make_exhibit(client, limit=10000.0, interval=3600.0)
+    send(client, eid, [
+        {"id": "a0", "ts": iso(BASE), "lux": 100, "source_id": "a"},
+        {"id": "c1", "ts": iso(BASE + 2700), "lux": 100, "source_id": "c"},
+        {"id": "d1", "ts": iso(BASE + 2700), "lux": 200, "source_id": "d"},
+        {"id": "a2", "ts": iso(BASE + 3600), "lux": 100, "source_id": "a"},
+    ])
+    put_priority(client, eid, ["a"], BASE - 10, 0)
+    # 窗口完全在冲突之前（BASE→BASE+900），后一个权威点 BASE+3600 与窗口侧
+    # 点之间夹着冲突：窗口末不得向 BASE+3600 线性裁剪，整窗缺测。
+    got = dose(client, eid, BASE, BASE + 900)
+    assert got["covered_seconds"] == 0.0
+    assert got["known_dose_luxh"] == 0.0
+    assert got["unknown_seconds"] == 900.0
+
+
+def test_conflict_between_pre_window_clip_point_and_first_point(client):
+    """冲突在窗口起点之前：窗口外裁剪点与首个窗内点之间夹着冲突，不跨冲突裁剪。"""
+    eid = make_exhibit(client, limit=10000.0, interval=3600.0)
+    send(client, eid, [
+        {"id": "a0", "ts": iso(BASE), "lux": 100, "source_id": "a"},
+        {"id": "c1", "ts": iso(BASE + 900), "lux": 100, "source_id": "c"},
+        {"id": "d1", "ts": iso(BASE + 900), "lux": 200, "source_id": "d"},
+        {"id": "a2", "ts": iso(BASE + 1800), "lux": 100, "source_id": "a"},
+        {"id": "a3", "ts": iso(BASE + 2700), "lux": 100, "source_id": "a"},
+    ])
+    put_priority(client, eid, ["a"], BASE - 10, 0)
+    # 窗口起点在冲突之后：窗内 a2→a3 合规段完整覆盖，a0 不跨过冲突裁剪进来
+    got = dose(client, eid, BASE + 1800, BASE + 2700)
+    assert got["covered_seconds"] == 900.0
+    assert got["unknown_seconds"] == 0.0
+    assert got["known_dose_luxh"] == 25.0
+    # 窗口起点恰为冲突时刻：窗内首点 a2 在冲突之后，前侧断开，整段缺测
+    at_conflict = dose(client, eid, BASE + 900, BASE + 1800)
+    assert at_conflict["covered_seconds"] == 0.0
+    assert at_conflict["unknown_seconds"] == 900.0
+
+
+def test_middle_conflict_diagnose_resets_chains_without_conflict_event(client):
+    """诊断连续链在冲突两侧重置：stuck 各自成段，无 timestamp_conflict，
+    也不把两侧权威点连成 gap / jump（即使间隔超限或速率会超限）。"""
+    eid = make_exhibit(client, interval=3600.0)
+    send(client, eid, [
+        {"id": "a0", "ts": iso(BASE), "lux": 100, "source_id": "a"},
+        {"id": "a1", "ts": iso(BASE + 900), "lux": 100, "source_id": "a"},
+        {"id": "c2", "ts": iso(BASE + 1800), "lux": 100, "source_id": "c"},
+        {"id": "d2", "ts": iso(BASE + 1800), "lux": 200, "source_id": "d"},
+        {"id": "a3", "ts": iso(BASE + 7200), "lux": 9999, "source_id": "a"},
+        {"id": "a4", "ts": iso(BASE + 8100), "lux": 9999, "source_id": "a"},
+    ])
+    put_priority(client, eid, ["a"], BASE - 10, 0)
+    events = diagnose(
+        client, eid, BASE, BASE + 9000,
+        max_rate=1.0, stuck_tol=0.0, min_stuck=900.0,
+    )["events"]
+    by_type: dict[str, list[dict]] = {}
+    for e in events:
+        by_type.setdefault(e["type"], []).append(e)
+    # 仲裁冲突不产生 timestamp_conflict；两侧点不连成 gap（间隔 5400>3600）
+    # 也不连成 jump（照度 100→9999 速率远超 1.0）
+    assert "timestamp_conflict" not in by_type
+    assert "gap" not in by_type
+    assert "jump" not in by_type
+    stucks = by_type["stuck"]
+    assert [s["reading_ids"] for s in stucks] == [["a0", "a1"], ["a3", "a4"]]
 
 
 # ---------- 诊断基于权威时间线 ----------
@@ -488,6 +683,63 @@ def test_calendar_dose_with_arbitration(client):
     got = dose(client, eid, BASE, BASE + 3600, extra={"calendar": "display"})
     assert got["known_dose_luxh"] == 100.0
     assert got["closed_seconds"] == 0.0
+
+
+def test_calendar_display_breaks_open_segments_at_middle_conflict(client):
+    """calendar=display：开放时段在仲裁冲突处断开，开放缺测计入 unknown。"""
+    # 2023-11-13 是周一（UTC）
+    mon = datetime(2023, 11, 13, 0, 0, tzinfo=timezone.utc).timestamp()
+    hour = 3600
+    eid = make_exhibit(client, limit=10000.0, interval=3600.0)
+    resp = client.put(f"/exhibits/{eid}/calendar", json={
+        "timezone": "UTC",
+        "weekly": [{"weekday": 1, "start": "09:00", "end": "17:00"}],
+    })
+    assert resp.status_code == 200, resp.text
+    send(client, eid, [
+        {"id": "a9", "ts": iso(mon + 9 * hour), "lux": 100, "source_id": "a"},
+        {"id": "a10", "ts": iso(mon + 10 * hour), "lux": 100, "source_id": "a"},
+        {"id": "c11", "ts": iso(mon + 11 * hour), "lux": 100, "source_id": "c"},
+        {"id": "d11", "ts": iso(mon + 11 * hour), "lux": 200, "source_id": "d"},
+        {"id": "a12", "ts": iso(mon + 12 * hour), "lux": 100, "source_id": "a"},
+        {"id": "a13", "ts": iso(mon + 13 * hour), "lux": 100, "source_id": "a"},
+    ])
+    put_priority(client, eid, ["a"], mon, 0)
+    got = dose(client, eid, mon + 9 * hour, mon + 14 * hour,
+               extra={"calendar": "display"})
+    # 开放 09:00–14:00 共 5h；冲突在 11:00 断开：覆盖 09–10 与 12–13 共 2h，
+    # 10–11、11–12、13–14 开放但缺测共 3h；窗口内无闭馆
+    assert got["known_dose_luxh"] == 200.0
+    assert got["covered_seconds"] == 2 * hour
+    assert got["unknown_seconds"] == 3 * hour
+    assert got["closed_seconds"] == 0.0
+    assert (got["covered_seconds"] + got["unknown_seconds"]
+            + got["closed_seconds"]) == 5 * hour
+    assert got["reading_count"] == 4  # 冲突时刻不计权威点
+
+
+def test_calendar_display_conflict_at_window_end_boundary(client):
+    """calendar=display：冲突恰在窗口终点（开放时段内）：末小时开放但缺测。"""
+    mon = datetime(2023, 11, 13, 0, 0, tzinfo=timezone.utc).timestamp()
+    hour = 3600
+    eid = make_exhibit(client, limit=10000.0, interval=3600.0)
+    client.put(f"/exhibits/{eid}/calendar", json={
+        "timezone": "UTC",
+        "weekly": [{"weekday": 1, "start": "09:00", "end": "17:00"}],
+    })
+    send(client, eid, [
+        {"id": "a10", "ts": iso(mon + 10 * hour), "lux": 100, "source_id": "a"},
+        {"id": "c11", "ts": iso(mon + 11 * hour), "lux": 100, "source_id": "c"},
+        {"id": "d11", "ts": iso(mon + 11 * hour), "lux": 200, "source_id": "d"},
+    ])
+    put_priority(client, eid, ["a"], mon, 0)
+    got = dose(client, eid, mon + 10 * hour, mon + 11 * hour,
+               extra={"calendar": "display"})
+    assert got["covered_seconds"] == 0.0
+    assert got["unknown_seconds"] == hour
+    assert got["closed_seconds"] == 0.0
+    assert got["known_dose_luxh"] == 0.0
+    assert got["reading_count"] == 1
 
 
 # ---------- 批次更正与仲裁 ----------

@@ -5,21 +5,26 @@
   剂量 = (lux_a + lux_b) / 2 * Δt(小时)。
 - 缺测段不插值：相邻读数间隔一旦**超过**最大采样间隔，该段不参与积分；
   窗口起止时刻可由相邻读数（含窗口外的最近一条）线性裁剪后覆盖。
+- 断点不连通：``break_ts`` 给出多来源仲裁保持冲突的时刻（升序）。
+  断点两侧的相邻权威点**绝不直接相连**——即使间隔合规也不积分，缺测、
+  截至窗口末累计剂量、首次越线、covered/unknown/closed 统计均按断点后
+  的各段分别处理；冲突时刻本身不作为积分端点。
 - 不带日历（``open_intervals=None``）时，窗口内时间只分两类：被有效段覆盖的
   部分计入 covered_seconds，其余全部计入 unknown_seconds（窗口前/后无读数、
-  跨缺测段等）。
+  跨缺测段、跨仲裁断点等）。
 - 带展陈日历（``open_intervals`` 为绝对开放区间列表）时，梯形积分只在开放
   区间内裁剪：窗口内闭馆时长计入 closed_seconds，开放但未被有效段覆盖的
   时长计入 unknown_seconds，三者之和等于窗口时长。
 - known_dose_luxh 只表示所查窗口 [start, end] 内的有效剂量；
   remaining_luxh / exceeded / first_exceeded_at 则依据**截至窗口末的
-  全历史累计**计算（带日历时只累计开放历史），因此首次越线时刻不会随
-  查询窗口缩窄而改变。
+  全历史累计**计算（带日历时只累计开放历史，且同样不跨过断点），因此首次
+  越线时刻不会随查询窗口缩窄而改变。
 - 剂量在查询时实时计算，乱序到达或补传的读数会立即反映到结果中。
 """
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -103,20 +108,33 @@ def compute_dose(
     max_interval_s: float,
     dose_limit_luxh: float,
     open_intervals: list[tuple[float, float]] | None = None,
+    break_ts: list[float] | None = None,
 ) -> DoseResult:
     """核算时段剂量。
 
     ``readings`` 必须包含：
-    - 窗口内（含端点）的全部读数；
-    - 窗口起点之前最近的一条读数（若存在）；
-    - 窗口终点之后最近的一条读数（若存在）。
-    这样窗口起止处才能按相邻读数线性裁剪，而截至窗口末的全历史累计
+    - 窗口内（含端点）的全部权威点；
+    - 窗口起点之前最近的一个权威点（若存在）；
+    - 窗口终点之后最近的一个权威点（若存在）。
+    这样窗口起止处才能按相邻权威点线性裁剪，而截至窗口末的全历史累计
     （读数自然按 ts 升序）也能从最早一条完整算起。
+
+    ``break_ts`` 为仲裁保持冲突的时刻（升序）：任意两个相邻权威点之间
+    若存在断点，则该对**绝不构成积分段**（与间隔是否超限无关），两个口径
+    都不累计，断点时长在窗口口径中按缺测处理（日历模式下开放部分计入
+    unknown、闭馆部分计入 closed）。
 
     ``open_intervals`` 为展陈日历展开后的绝对开放区间（Unix 秒，升序、互不
     重叠），须覆盖从最早读数到窗口末的全部相关时间；传入后积分只在开放
     区间内裁剪，历史口径也只累计开放历史。为 None 时保持原有口径。
     """
+    breaks = sorted(break_ts or [])
+
+    def broken_between(lo: float, hi: float) -> bool:
+        """(lo, hi) 内是否存在仲裁断点（开区间：与端点重合不影响该对）。"""
+        i = bisect_left(breaks, lo)
+        return i < len(breaks) and breaks[i] < hi
+
     window_known = 0.0
     covered = 0.0
     history_known = 0.0
@@ -127,7 +145,8 @@ def compute_dose(
     for ts, lux in readings:
         if prev_ts is not None:
             dt = ts - prev_ts
-            if dt > 0.0 and dt <= max_interval_s:
+            # 间隔超限或两点之间存在仲裁断点：不插值、不连通，两个口径都不累计
+            if dt > 0.0 and dt <= max_interval_s and not broken_between(prev_ts, ts):
                 # ---- 窗口口径：与 [start_s, end_s]（及开放区间）求交后梯形裁剪 ----
                 for lo, hi in _pieces(prev_ts, ts, start_s, end_s, open_intervals):
                     l_lo = _lux_at(prev_lux, lux, (lo - prev_ts) / dt)
@@ -147,7 +166,7 @@ def compute_dose(
                         offset = _crossing_offset(h_lux_lo, h_lux_hi, h_dt, need_luxs)
                         first_exceeded_at = lo + (offset if offset is not None else h_dt)
                     history_known += h_seg
-            # 间隔超过上限：缺测段不插值，两个口径都不累计
+            # 间隔超过上限或跨仲裁断点：缺测/冲突段不插值，两个口径都不累计
         prev_ts, prev_lux = ts, lux
 
     window_len = end_s - start_s

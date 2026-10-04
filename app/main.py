@@ -15,8 +15,8 @@ from fastapi.responses import FileResponse
 from .arbitration import (
     ArbitrationPoint,
     arbitrate,
+    diagnosis_breaks,
     diagnosis_feed,
-    first_point_after,
     load_priority_versions,
 )
 from .calendar import (
@@ -591,12 +591,15 @@ def diagnose_readings(
       并从两侧中断连续链；
     - 已配置来源优先级版本时，诊断基于**权威时间线**：每个采样时刻先按
       生效版本仲裁（最高优先级来源胜出；最高级并列且照度不同的时刻保持
-      冲突、不落点），被仲裁丢弃的低优先级读数不进入诊断时间线；
+      冲突、不落点），被仲裁丢弃的低优先级读数不进入诊断时间线；仲裁
+      保持冲突的时刻只把连续链在两侧静默重置，**不产生任何诊断事件**
+      （冲突状态保留在权威时间线查询中，不生成 ``timestamp_conflict``）；
     - 对无歧义读数：相邻间隔**超过**展品 ``max_interval_seconds`` 记为
       ``gap``；间隔合规但变化速率 ``|Δlux|/Δt`` 超过
       ``max_rate_lux_per_second`` 记为 ``jump``；相邻照度差均不超过
       ``stuck_tolerance_lux`` 且首末累计时长达到 ``min_stuck_seconds`` 的
-      最大连续段记为 ``stuck``；gap、jump 与时间冲突都会截断 stuck 链；
+      最大连续段记为 ``stuck``；gap、jump、时间冲突与仲裁断点都会截断
+      stuck 链；
     - 事件**先基于规范档案的完整时间线形成**，再筛选与查询窗口相交的结果：
       缩窄窗口只影响哪些事件被返回，**不改变任何事件的原始边界与相关读数**；
     - 结果按 (起点, 类型) 稳定排序；每个事件给出边界、相关读数 ID 以及
@@ -619,12 +622,16 @@ def diagnose_readings(
         (canonical_id,),
     ).fetchall()
     versions = load_priority_versions(conn, canonical_id)
+    breaks: list[float] = []
     if versions:
         points, arb_conflicts = arbitrate(
             [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in rows],
             versions,
         )
-        feed = diagnosis_feed(points, arb_conflicts)
+        # 仲裁保持冲突的时刻不进入诊断输入：只作为断点让连续链在两侧重置，
+        # 不生成 timestamp_conflict（冲突状态仅保留在权威时间线查询中）。
+        feed = diagnosis_feed(points)
+        breaks = diagnosis_breaks(arb_conflicts)
     else:
         feed = [(r["reading_id"], r["ts"], r["lux"]) for r in rows]
     events = build_events(
@@ -633,6 +640,7 @@ def diagnose_readings(
         max_rate_lux_per_s=payload.max_rate_lux_per_second,
         stuck_tol_lux=payload.stuck_tolerance_lux,
         min_stuck_s=payload.min_stuck_seconds,
+        breaks=breaks,
     )
     events = sort_events(intersect_window(events, start_s, end_s))
 
@@ -690,8 +698,11 @@ def query_dose(
     - 剂量在查询时基于全部已存读数实时重算，补传读数立即生效；
     - 请求 ID 若是已归并档案的别名，自动解析到规范档案；
     - 已配置来源优先级版本时，剂量基于**权威时间线**：每个采样时刻按生效
-      版本仲裁出权威值（最高级并列且照度不同的时刻保持冲突、不进入剂量
-      时间线），``reading_count`` 为窗口内权威点数量；未配置时保持原有口径；
+      版本仲裁出权威值（最高级并列且照度不同的时刻保持冲突）；冲突时刻
+      不作为积分端点，其前后相邻权威点**绝不直接相连**——即使间隔合规也
+      在冲突处断开，缺测、截至窗口末累计剂量、首次越线与
+      covered/unknown/closed 统计均按断点后的各段分别处理；
+      ``reading_count`` 为窗口内权威点数量；未配置时保持原有口径；
     - ``calendar=display`` 时仅在开放区间内裁剪梯形积分：窗口内闭馆时长
       单列 closed_seconds，covered_seconds、unknown_seconds、closed_seconds
       之和等于窗口时长；剩余额度与首次越线也按截至窗口末的开放历史计算；
@@ -705,26 +716,26 @@ def query_dose(
         raise HTTPException(status_code=422, detail="end 必须晚于 start")
 
     # 窗口口径只算 [start, end]，但需要：
-    # 1) 截至 end 的全部历史读数——remaining/exceeded/first_exceeded_at 按全历史累计；
-    # 2) end 之后最近一条读数——窗口末端可向其线性裁剪。
-    # 窗口起点之前的历史读数本身就在 1) 中，窗口起点处同样可线性裁剪。
-    # 配置了来源优先级版本时，读数先逐时刻仲裁为权威时间线（冲突时刻不进入）。
+    # 1) 截至 end 的全部历史权威点——remaining/exceeded/first_exceeded_at 按全历史累计；
+    # 2) end 之后最近一个权威点——窗口末端可向其线性裁剪。
+    # 窗口起点之前的历史权威点本身就在 1) 中，窗口起点处同样可线性裁剪。
+    # 配置了来源优先级版本时，读数先逐时刻仲裁为权威时间线；保持冲突的
+    # 时刻不作为积分端点，而是作为断点使两侧权威点绝不直接相连（普通剂量
+    # 与 calendar=display 的开放时段都在冲突处断开）。
     versions = load_priority_versions(conn, canonical_id)
+    breaks: list[float] = []
     if versions:
         all_rows = conn.execute(
             "SELECT reading_id, ts, lux, source_id FROM readings "
-            "WHERE exhibit_id = ? AND ts <= ? AND voided_at IS NULL "
-            "ORDER BY ts, reading_id",
-            (canonical_id, end_s),
+            "WHERE exhibit_id = ? AND voided_at IS NULL ORDER BY ts, reading_id",
+            (canonical_id,),
         ).fetchall()
-        points, _arb_conflicts = arbitrate(
+        points, arb_conflicts = arbitrate(
             [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in all_rows],
             versions,
         )
         readings = [(p.ts, p.lux) for p in points]
-        after_point = first_point_after(conn, canonical_id, versions, end_s)
-        if after_point is not None:
-            readings.append((after_point.ts, after_point.lux))
+        breaks = [c.ts for c in arb_conflicts]
     else:
         all_rows = conn.execute(
             "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts <= ? "
@@ -760,6 +771,7 @@ def query_dose(
         max_interval_s=exhibit["max_interval_seconds"],
         dose_limit_luxh=exhibit["dose_limit_luxh"],
         open_intervals=intervals,
+        break_ts=breaks,
     )
     response = DoseResponse(
         requested_id=exhibit_id,

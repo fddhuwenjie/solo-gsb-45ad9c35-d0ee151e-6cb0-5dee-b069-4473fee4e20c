@@ -11,8 +11,10 @@
   版本（version 最大者；没有生效版本时全部读数平权），在生效版本下取
   优先级最高的来源集合：
   * 集合内照度唯一 → 该值为该时刻的**权威值**；
-  * 集合内照度不同（最高级并列）→ 该时刻**保持冲突**，不进入剂量或
-    诊断时间线（诊断中仍作为 ``timestamp_conflict`` 事件出现）。
+  * 集合内照度不同（最高级并列）→ 该时刻**保持冲突**。冲突时刻只保留在
+    权威时间线查询中：不进入剂量积分（两侧权威点绝不跨过它直接相连，
+    普通剂量与 ``calendar=display`` 开放时段都在此断开），也不作为诊断
+    输入（诊断连续链在两侧重置，且不生成 ``timestamp_conflict``）。
 - 优先级调整只从生效时刻起影响重算：历史收据与原始读数行绝不改写，
   仲裁在查询时实时进行。
 - 展品没有任何优先级版本时，仲裁退化为原有平权口径（同时刻同值合并、
@@ -56,7 +58,12 @@ class ArbitrationPoint:
 
 @dataclass
 class ArbitrationConflict:
-    """保持冲突的时刻：最高优先级并列且照度不同，不进入剂量/诊断时间线。"""
+    """保持冲突的时刻：最高优先级并列且照度不同。
+
+    只保留给权威时间线查询；既不作为剂量积分端点（时间线在此时刻断开，
+    两侧权威点不直接相连），也不作为诊断输入（诊断链在两侧重置且不生成
+    ``timestamp_conflict``）。
+    """
 
     ts: float
     members: list[Member]    # 并列最高优先级的读数集合（照度不唯一）
@@ -157,54 +164,25 @@ def arbitrate(
     return points, conflicts
 
 
-def diagnosis_feed(
-    points: list[ArbitrationPoint],
-    conflicts: list[ArbitrationConflict],
-) -> list[tuple[str, float, float]]:
-    """把仲裁结果展开为诊断模块的输入读数。
+def diagnosis_feed(points: list[ArbitrationPoint]) -> list[tuple[str, float, float]]:
+    """把仲裁成功的权威点展开为诊断模块的输入读数。
 
-    权威点按胜出集合逐条展开（同值，诊断分组会重新合并为一个点）；
-    冲突时刻按并列集合逐条展开（异值，诊断会形成 timestamp_conflict，
-    该时刻不落点）。被仲裁丢弃的低优先级读数不进入诊断时间线。
+    权威点按胜出集合逐条展开（同值，诊断分组会重新合并为一个点）。
+    保持冲突的时刻**不进入诊断输入**：它们由 ``diagnosis_breaks`` 作为
+    纯断点交给诊断模块——连续链在两侧重置，但不产生 ``timestamp_conflict``
+    （仲裁冲突只在权威时间线查询中保留）。被仲裁丢弃的低优先级读数同样
+    不进入诊断时间线。
     """
     feed: list[tuple[str, float, float]] = []
     for p in points:
         for m in p.members:
             feed.append((m.reading_id, p.ts, p.lux))
-    for c in conflicts:
-        for m in c.members:
-            feed.append((m.reading_id, c.ts, m.lux))
     return feed
 
 
-def first_point_after(
-    conn: sqlite3.Connection,
-    exhibit_id: str,
-    versions: list[PriorityVersion],
-    ts: float,
-) -> ArbitrationPoint | None:
-    """ts 之后最近的权威点（跳过保持冲突的时刻）；没有则 None。"""
-    cursor = ts
-    while True:
-        row = conn.execute(
-            "SELECT MIN(ts) AS t FROM readings "
-            "WHERE exhibit_id = ? AND ts > ? AND voided_at IS NULL",
-            (exhibit_id, cursor),
-        ).fetchone()
-        if row["t"] is None:
-            return None
-        members = conn.execute(
-            "SELECT reading_id, ts, lux, source_id FROM readings "
-            "WHERE exhibit_id = ? AND ts = ? AND voided_at IS NULL ORDER BY reading_id",
-            (exhibit_id, row["t"]),
-        ).fetchall()
-        points, _ = arbitrate(
-            [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in members],
-            versions,
-        )
-        if points:
-            return points[0]
-        cursor = row["t"]  # 该时刻保持冲突，继续向后找
+def diagnosis_breaks(conflicts: list[ArbitrationConflict]) -> list[float]:
+    """仲裁保持冲突的时刻（升序）：诊断链在这些时刻两侧静默重置。"""
+    return [c.ts for c in conflicts]
 
 
 # ---------- 归并辅助 ----------
